@@ -3,7 +3,7 @@ from flask.views import MethodView
 from marshmallow import Schema, fields, validates_schema, ValidationError, INCLUDE
 from werkzeug.datastructures import FileStorage
 from webargs.flaskparser import parser
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, List, Tuple, Set
 import csv
 import io
 import uuid
@@ -21,8 +21,55 @@ blp_complaints = Blueprint(
 UPLOAD_STORE: Dict[str, Dict[str, Any]] = {}
 ANALYSIS_STORE: Dict[str, Dict[str, Any]] = {}
 
+# Core required columns for baseline checks
 REQUIRED_COLUMNS = ["complaint_id", "date", "description", "severity"]
 
+# Optional columns for hazardous situation validation rules
+HS_OPTIONAL_COLUMNS = [
+    "device_use_at_time_of_event",
+    "problem_definition_description",
+    "investigation_summary",
+    "problem_definition_hazardous_situation",
+    "hazard_grid"  # can be a delimited list of hazards e.g., "electrical; thermal"
+]
+
+# Rule codes per requirements
+RULE_CODES = {
+    "HS_NO_HS_WHEN_HAZARDS": "HS_NO_HS_WHEN_HAZARDS",
+    "HS_DEVICE_USE_MISMATCH": "HS_DEVICE_USE_MISMATCH",
+    "HS_UNKNOWN_DEVICE_USE_REVIEW": "HS_UNKNOWN_DEVICE_USE_REVIEW",
+    "HS_HAZARD_GRID_MISSING": "HS_HAZARD_GRID_MISSING",
+    "HS_HAZARD_GRID_MISMATCH": "HS_HAZARD_GRID_MISMATCH",
+}
+
+# Simple keyword sets to derive hazards from free text (stdlib only)
+HAZARD_KEYWORDS: Dict[str, Set[str]] = {
+    "electrical": {"shock", "electrocute", "electrical", "short circuit", "spark", "power surge"},
+    "thermal": {"burn", "overheat", "hot", "thermal", "scald"},
+    "mechanical": {"pinch", "crush", "breakage", "fracture", "mechanical", "shear"},
+    "biological": {"infection", "contamination", "bio", "bacterial", "viral", "fungal"},
+    "chemical": {"corrosive", "toxic", "chemical", "solvent", "acid", "alkali"},
+    "radiation": {"radiation", "x-ray", "radioactive", "gamma", "uv"},
+    "software": {"bug", "software", "crash", "firmware", "hang", "error code"},
+    "use error": {"misuse", "user error", "use error", "incorrect use", "misinterpret"},
+}
+
+# Normalization helpers for device use
+DEVICE_USE_NORMALIZATION = {
+    "in use": "in_use",
+    "in-use": "in_use",
+    "in_use": "in_use",
+    "being used": "in_use",
+    "not in use": "not_in_use",
+    "not-in-use": "not_in_use",
+    "stored": "not_in_use",
+    "transport": "not_in_use",
+    "unknown": "unknown",
+    "n/a": "unknown",
+    "na": "unknown",
+    "": "unknown",
+    None: "unknown"
+}
 
 # Schemas
 
@@ -55,6 +102,8 @@ class AnalyzeRequestSchema(Schema):
 class IssueSchema(Schema):
     row_index = fields.Int(required=True, description="Zero-based row index in the data (excluding header).")
     message = fields.Str(required=True, description="Description of the issue for the row.")
+    code = fields.Str(required=False, description="Rule/violation code.")
+    details = fields.Dict(required=False, description="Structured details for the violation.")
 
 
 class AnalyzeResponseSchema(Schema):
@@ -67,6 +116,12 @@ class AnalyzeResponseSchema(Schema):
     issues = fields.List(fields.Nested(IssueSchema), required=True, description="List of correctness issues found.")
     row_count = fields.Int(required=True, description="Number of data rows evaluated.")
     columns = fields.List(fields.Str(), required=True, description="Columns present in the analyzed dataset.")
+    # Additional summary metrics for new HS rules
+    hs_summary = fields.Dict(
+        keys=fields.Str(), values=fields.Int(),
+        required=False,
+        description="Summary counts for hazardous situation validation rules."
+    )
 
 
 class ReportResponseSchema(Schema):
@@ -82,9 +137,7 @@ def _read_csv_file_to_rows(file_storage: FileStorage) -> Tuple[List[Dict[str, An
     Assumes UTF-8; uses Python's csv module.
     """
     try:
-        # Read bytes and decode for csv
         raw = file_storage.read()
-        # Reset stream pointer for any re-reads
         file_storage.stream.seek(0)
         text = raw.decode("utf-8")
     except Exception as e:
@@ -110,8 +163,209 @@ def _parse_date_safe(value: str) -> bool:
         return False
 
 
-def _analyze_rows(rows: List[Dict[str, Any]], columns: List[str]) -> Tuple[Dict[str, float], List[Dict[str, Any]]]:
+def _norm(s: Any) -> str:
+    """Normalize general free-text values for comparison."""
+    if s is None:
+        return ""
+    return str(s).strip().lower()
+
+
+def _split_hazard_grid(value: str) -> List[str]:
+    """
+    Parse hazard_grid column into a normalized list of hazards.
+    Supports separators ; , | and handles extra whitespace.
+    """
+    if not value:
+        return []
+    raw = _norm(value)
+    parts = []
+    for sep in [";", ",", "|"]:
+        if sep in raw:
+            parts = [p.strip() for p in raw.split(sep)]
+            break
+    if not parts:
+        parts = [raw]
+    # remove empties and normalize
+    return [p for p in (p.strip() for p in parts) if p]
+
+
+def _normalize_device_use(value: Any) -> str:
+    """Normalize device use categories into in_use, not_in_use, or unknown."""
+    key = _norm(value)
+    return DEVICE_USE_NORMALIZATION.get(key, DEVICE_USE_NORMALIZATION.get(key.replace(" ", "_"), "unknown"))
+
+
+def _derive_hazards_from_text(*texts: str) -> Set[str]:
+    """
+    Derive a set of hazards by simple keyword matching across provided texts.
+    Uses HAZARD_KEYWORDS; returns normalized hazard names that matched.
+    """
+    joined = " ".join(_norm(t) for t in texts if t)
+    derived: Set[str] = set()
+    for hz, keywords in HAZARD_KEYWORDS.items():
+        for kw in keywords:
+            if kw in joined:
+                derived.add(hz)
+                break
+    return derived
+
+
+def _row_hs_checks(row: Dict[str, Any], colmap: Dict[str, str]) -> List[Dict[str, Any]]:
+    """
+    Perform hazardous situation related checks on a single row.
+    Returns a list of issue dicts with code, message, details.
+    """
     issues: List[Dict[str, Any]] = []
+
+    # Extract and normalize relevant fields
+    device_use = _normalize_device_use(row.get(colmap.get("device_use_at_time_of_event", ""), ""))
+    desc = row.get(colmap.get("problem_definition_description", ""), "") or row.get("description", "")
+    inv_sum = row.get(colmap.get("investigation_summary", ""), "")
+    hs_text = row.get(colmap.get("problem_definition_hazardous_situation", ""), "")
+    hz_grid_raw = row.get(colmap.get("hazard_grid", ""), "")
+
+    # Normalize hazardous situation text value
+    hs_norm = _norm(hs_text)
+    no_hs_values = {"no hazardous situation", "no hs", "none", "n/a", "na", ""}
+    has_no_hs = hs_norm in no_hs_values
+
+    # Parse hazard grid list
+    hazard_grid_list = _split_hazard_grid(hz_grid_raw)
+    hazard_grid_set = set(hazard_grid_list)
+
+    # Derive hazards from description + investigation summary
+    derived_hazards = _derive_hazards_from_text(desc, inv_sum)
+
+    # Rule: Grid missing
+    if colmap.get("hazard_grid") and not hazard_grid_list and (desc or inv_sum):
+        issues.append({
+            "code": RULE_CODES["HS_HAZARD_GRID_MISSING"],
+            "message": "Hazard Grid is empty but narrative content exists.",
+            "details": {
+                "device_use": device_use,
+                "derived_hazards": sorted(list(derived_hazards)),
+                "hazard_grid": []
+            }
+        })
+
+    # Rule: No Hazardous Situation cannot coexist with hazards in grid
+    if has_no_hs and hazard_grid_list:
+        issues.append({
+            "code": RULE_CODES["HS_NO_HS_WHEN_HAZARDS"],
+            "message": "Hazardous Situation marked as 'No Hazardous Situation' but hazards are present in Hazard Grid.",
+            "details": {
+                "hazardous_situation": hs_norm,
+                "hazard_grid": hazard_grid_list
+            }
+        })
+
+    # Rule: Mismatch between derived hazards and hazard grid
+    if derived_hazards:
+        # We consider names normalized like in HAZARD_KEYWORDS keys
+        # Map grid strings to normalized keys if they match known hazard labels
+        normalized_grid = { _norm(h) for h in hazard_grid_set }
+        # if derived not subset of grid -> mismatch
+        if not derived_hazards.issubset(normalized_grid):
+            issues.append({
+                "code": RULE_CODES["HS_HAZARD_GRID_MISMATCH"],
+                "message": "Derived hazards from narrative do not match Hazard Grid.",
+                "details": {
+                    "derived_hazards": sorted(list(derived_hazards)),
+                    "hazard_grid": sorted(list(normalized_grid))
+                }
+            })
+
+    # Rule: Device use mismatch with HS
+    # If device was "not_in_use" but hazards found in grid or narrative indicate active use hazards (e.g., electrical/thermal/mechanical),
+    # then likely mismatch.
+    active_use_hazards = {"electrical", "thermal", "mechanical", "radiation"}
+    narrative_active = bool(derived_hazards & active_use_hazards)
+    grid_active = bool({ _norm(h) for h in hazard_grid_set } & active_use_hazards)
+
+    if device_use == "not_in_use" and (narrative_active or grid_active):
+        issues.append({
+            "code": RULE_CODES["HS_DEVICE_USE_MISMATCH"],
+            "message": "Device reported as 'not in use' while hazards indicate active device interaction.",
+            "details": {
+                "device_use": device_use,
+                "derived_hazards": sorted(list(derived_hazards)),
+                "hazard_grid": sorted(list(hazard_grid_set))
+            }
+        })
+
+    # Rule: Unknown device use should be flagged for review when hazards exist
+    if device_use == "unknown" and (derived_hazards or hazard_grid_list):
+        issues.append({
+            "code": RULE_CODES["HS_UNKNOWN_DEVICE_USE_REVIEW"],
+            "message": "Device use at time of event is unknown; review recommended due to hazards present.",
+            "details": {
+                "device_use": device_use,
+                "derived_hazards": sorted(list(derived_hazards)),
+                "hazard_grid": sorted(list(hazard_grid_set))
+            }
+        })
+
+    return issues
+
+
+def _map_optional_columns(columns: List[str]) -> Dict[str, str]:
+    """
+    Build a map from canonical optional keys to actual CSV column names present.
+    Allows flexible matching via case-insensitive and simplified keys.
+    """
+    lc_cols = {c.lower(): c for c in columns}
+    mapping: Dict[str, str] = {}
+
+    def find_col(candidates: List[str]) -> str:
+        for cand in candidates:
+            if cand in lc_cols:
+                return lc_cols[cand]
+        return ""
+
+    mapping["device_use_at_time_of_event"] = find_col([
+        "device use at time of event",
+        "device_use_at_time_of_event",
+        "device use",
+        "device_use",
+        "use at time of event",
+    ])
+    mapping["problem_definition_description"] = find_col([
+        "problem definition: description",
+        "problem_definition_description",
+        "description",
+    ])
+    mapping["investigation_summary"] = find_col([
+        "investigation: investigation summary",
+        "investigation_summary",
+        "investigation summary",
+    ])
+    mapping["problem_definition_hazardous_situation"] = find_col([
+        "problem definition: hazardous situation",
+        "problem_definition_hazardous_situation",
+        "hazardous situation",
+        "hazardous_situation",
+        "hs",
+    ])
+    mapping["hazard_grid"] = find_col([
+        "hazard grid",
+        "hazard_grid",
+        "hazards",
+    ])
+
+    return mapping
+
+
+def _analyze_rows(rows: List[Dict[str, Any]], columns: List[str]) -> Tuple[Dict[str, float], List[Dict[str, Any]], Dict[str, int]]:
+    """
+    Perform baseline completeness checks and hazardous situation/device use validation rules.
+
+    Returns:
+      - completeness metrics
+      - issues list (with per-row codes/details)
+      - hs_summary: counts of hazardous situation rule violations by code
+    """
+    issues: List[Dict[str, Any]] = []
+    hs_summary: Dict[str, int] = {code: 0 for code in RULE_CODES.values()}
 
     # Completeness metrics initialization
     total = len(rows)
@@ -123,7 +377,7 @@ def _analyze_rows(rows: List[Dict[str, Any]], columns: List[str]) -> Tuple[Dict[
             "description_non_empty": 0.0,
             "overall_valid_rows": 0.0
         }
-        return completeness, issues
+        return completeness, issues, hs_summary
 
     missing_required = _validate_required_columns(columns)
     required_columns_present = 100.0 if not missing_required else 0.0
@@ -137,7 +391,6 @@ def _analyze_rows(rows: List[Dict[str, Any]], columns: List[str]) -> Tuple[Dict[
 
     seen_ids = set()
     unique_ok_count = 0
-    complaint_id_duplicate_rows = []
 
     # First pass to gather id frequencies
     id_counts: Dict[str, int] = {}
@@ -145,6 +398,9 @@ def _analyze_rows(rows: List[Dict[str, Any]], columns: List[str]) -> Tuple[Dict[
         cid = (r.get("complaint_id") or "").strip()
         if cid:
             id_counts[cid] = id_counts.get(cid, 0) + 1
+
+    # Optional column mapping for HS rules
+    colmap = _map_optional_columns(columns)
 
     for idx, r in enumerate(rows):
         row_valid = True
@@ -167,19 +423,27 @@ def _analyze_rows(rows: List[Dict[str, Any]], columns: List[str]) -> Tuple[Dict[
                 row_valid = False
             elif id_counts.get(cid, 0) > 1:
                 if cid not in seen_ids:
-                    # Only flag each duplicate id once at first occurrence
                     issues.append({"row_index": idx, "message": f"Duplicate complaint_id '{cid}'"})
-                    complaint_id_duplicate_rows.append(idx)
                 row_valid = False
         seen_ids.add(cid)
 
-        # non-empty description
-        desc = (r.get("description") or "").strip()
+        # non-empty description (prefer specific column if present)
+        desc_col = colmap.get("problem_definition_description") or "description"
+        desc = (r.get(desc_col) or "").strip()
         if desc:
             non_empty_desc_count += 1
         else:
             issues.append({"row_index": idx, "message": "Empty description"})
             row_valid = False
+
+        # Hazardous situation / device use validations
+        hs_issues = _row_hs_checks(r, colmap)
+        for iss in hs_issues:
+            iss["row_index"] = idx
+            issues.append(iss)
+            code = iss.get("code")
+            if code:
+                hs_summary[code] = hs_summary.get(code, 0) + 1
 
         if row_valid:
             valid_rows_count += 1
@@ -191,7 +455,7 @@ def _analyze_rows(rows: List[Dict[str, Any]], columns: List[str]) -> Tuple[Dict[
         "description_non_empty": round((non_empty_desc_count / total) * 100.0, 2),
         "overall_valid_rows": round((valid_rows_count / total) * 100.0, 2),
     }
-    return completeness, issues
+    return completeness, issues, hs_summary
 
 
 # Routes
@@ -247,15 +511,22 @@ class ComplaintsAnalyze(MethodView):
     Response:
       - analysis_id
       - completeness metrics (%)
-      - issues list
+      - issues list (with codes/details for HS rules)
       - row_count
       - columns
+      - hs_summary: counts per HS rule
     """
     @blp_complaints.arguments(AnalyzeRequestSchema, location="form")
     @blp_complaints.response(200, AnalyzeResponseSchema)
     @blp_complaints.doc(
         summary="Analyze complaint data",
-        description="Runs checks: required columns present, date parseable (YYYY-MM-DD), unique complaint_id, non-empty description."
+        description=(
+            "Runs checks: required columns present, date parseable (YYYY-MM-DD), unique complaint_id, "
+            "non-empty description. Adds HS rules: checks consistency among Device Use, Hazardous Situation text, "
+            "Hazard Grid, and derived hazards from narrative. Returns per-row violations with codes: "
+            "HS_NO_HS_WHEN_HAZARDS, HS_DEVICE_USE_MISMATCH, HS_UNKNOWN_DEVICE_USE_REVIEW, "
+            "HS_HAZARD_GRID_MISSING, HS_HAZARD_GRID_MISMATCH."
+        )
     )
     def post(self, form_args):
         rows: List[Dict[str, Any]] = []
@@ -278,14 +549,15 @@ class ComplaintsAnalyze(MethodView):
             rows = stored["rows"]
             columns = stored["columns"]
 
-        completeness, issues = _analyze_rows(rows, columns)
+        completeness, issues, hs_summary = _analyze_rows(rows, columns)
         analysis_id = str(uuid.uuid4())
         result = {
             "analysis_id": analysis_id,
             "completeness": completeness,
             "issues": issues,
             "row_count": len(rows),
-            "columns": columns
+            "columns": columns,
+            "hs_summary": hs_summary
         }
         ANALYSIS_STORE[analysis_id] = result
         return result
