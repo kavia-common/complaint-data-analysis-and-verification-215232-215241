@@ -3,6 +3,7 @@ from flask_cors import CORS
 from flask_smorest import Api
 from .routes.health import blp as health_blp
 from .routes.complaints import blp_complaints
+from .routes.verification import blp_verification
 
 app = Flask(__name__)
 app.url_map.strict_slashes = False
@@ -22,6 +23,7 @@ app.config["API_SPEC_OPTIONS"] = {
     "tags": [
         {"name": "Healt Check", "description": "Health check route"},
         {"name": "Complaints", "description": "Upload and analysis of complaint data"},
+        {"name": "Verification", "description": "Complaint verification results based on rules"},
     ]
 }
 
@@ -29,3 +31,4 @@ api = Api(app)
 # Register blueprints
 api.register_blueprint(health_blp)
 api.register_blueprint(blp_complaints)
+api.register_blueprint(blp_verification)
