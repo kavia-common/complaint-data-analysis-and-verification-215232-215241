@@ -104,6 +104,7 @@ class IssueSchema(Schema):
     message = fields.Str(required=True, description="Description of the issue for the row.")
     code = fields.Str(required=False, description="Rule/violation code.")
     details = fields.Dict(required=False, description="Structured details for the violation.")
+    fields = fields.List(fields.Str(), required=False, description="CSV column names involved in the violation.")
 
 
 class AnalyzeResponseSchema(Schema):
@@ -121,6 +122,18 @@ class AnalyzeResponseSchema(Schema):
         keys=fields.Str(), values=fields.Int(),
         required=False,
         description="Summary counts for hazardous situation validation rules."
+    )
+    # Derived hazards aggregated across dataset
+    derived_hazards = fields.List(
+        fields.Str(),
+        required=False,
+        description="Unique set of hazards derived from narrative across all rows."
+    )
+    # Summary counters for quick UI badges
+    summary = fields.Dict(
+        keys=fields.Str(), values=fields.Int(),
+        required=False,
+        description="High-level counters: total_violations, rows_with_violations, rows_without_violations."
     )
 
 
@@ -245,7 +258,10 @@ def _row_hs_checks(row: Dict[str, Any], colmap: Dict[str, str]) -> List[Dict[str
                 "device_use": device_use,
                 "derived_hazards": sorted(list(derived_hazards)),
                 "hazard_grid": []
-            }
+            },
+            "fields": [c for c in [colmap.get("hazard_grid") or "hazard_grid",
+                                   colmap.get("problem_definition_description") or "description",
+                                   colmap.get("investigation_summary") or "investigation_summary"] if c]
         })
 
     # Rule: No Hazardous Situation cannot coexist with hazards in grid
@@ -256,7 +272,9 @@ def _row_hs_checks(row: Dict[str, Any], colmap: Dict[str, str]) -> List[Dict[str
             "details": {
                 "hazardous_situation": hs_norm,
                 "hazard_grid": hazard_grid_list
-            }
+            },
+            "fields": [c for c in [colmap.get("problem_definition_hazardous_situation") or "problem_definition_hazardous_situation",
+                                   colmap.get("hazard_grid") or "hazard_grid"] if c]
         })
 
     # Rule: Mismatch between derived hazards and hazard grid
@@ -272,7 +290,10 @@ def _row_hs_checks(row: Dict[str, Any], colmap: Dict[str, str]) -> List[Dict[str
                 "details": {
                     "derived_hazards": sorted(list(derived_hazards)),
                     "hazard_grid": sorted(list(normalized_grid))
-                }
+                },
+                "fields": [c for c in [colmap.get("hazard_grid") or "hazard_grid",
+                                       colmap.get("problem_definition_description") or "description",
+                                       colmap.get("investigation_summary") or "investigation_summary"] if c]
             })
 
     # Rule: Device use mismatch with HS
@@ -290,7 +311,11 @@ def _row_hs_checks(row: Dict[str, Any], colmap: Dict[str, str]) -> List[Dict[str
                 "device_use": device_use,
                 "derived_hazards": sorted(list(derived_hazards)),
                 "hazard_grid": sorted(list(hazard_grid_set))
-            }
+            },
+            "fields": [c for c in [colmap.get("device_use_at_time_of_event") or "device_use_at_time_of_event",
+                                   colmap.get("hazard_grid") or "hazard_grid",
+                                   colmap.get("problem_definition_description") or "description",
+                                   colmap.get("investigation_summary") or "investigation_summary"] if c]
         })
 
     # Rule: Unknown device use should be flagged for review when hazards exist
@@ -302,7 +327,11 @@ def _row_hs_checks(row: Dict[str, Any], colmap: Dict[str, str]) -> List[Dict[str
                 "device_use": device_use,
                 "derived_hazards": sorted(list(derived_hazards)),
                 "hazard_grid": sorted(list(hazard_grid_set))
-            }
+            },
+            "fields": [c for c in [colmap.get("device_use_at_time_of_event") or "device_use_at_time_of_event",
+                                   colmap.get("hazard_grid") or "hazard_grid",
+                                   colmap.get("problem_definition_description") or "description",
+                                   colmap.get("investigation_summary") or "investigation_summary"] if c]
         })
 
     return issues
@@ -355,7 +384,7 @@ def _map_optional_columns(columns: List[str]) -> Dict[str, str]:
     return mapping
 
 
-def _analyze_rows(rows: List[Dict[str, Any]], columns: List[str]) -> Tuple[Dict[str, float], List[Dict[str, Any]], Dict[str, int]]:
+def _analyze_rows(rows: List[Dict[str, Any]], columns: List[str]) -> Tuple[Dict[str, float], List[Dict[str, Any]], Dict[str, int], List[str], Dict[str, int]]:
     """
     Perform baseline completeness checks and hazardous situation/device use validation rules.
 
@@ -366,6 +395,7 @@ def _analyze_rows(rows: List[Dict[str, Any]], columns: List[str]) -> Tuple[Dict[
     """
     issues: List[Dict[str, Any]] = []
     hs_summary: Dict[str, int] = {code: 0 for code in RULE_CODES.values()}
+    dataset_derived_hazards: Set[str] = set()
 
     # Completeness metrics initialization
     total = len(rows)
@@ -377,12 +407,18 @@ def _analyze_rows(rows: List[Dict[str, Any]], columns: List[str]) -> Tuple[Dict[
             "description_non_empty": 0.0,
             "overall_valid_rows": 0.0
         }
-        return completeness, issues, hs_summary
+        # No rows; nothing to derive
+        summary = {
+            "total_violations": 0,
+            "rows_with_violations": 0,
+            "rows_without_violations": 0
+        }
+        return completeness, issues, hs_summary, sorted(list(dataset_derived_hazards)), summary, [], summary
 
     missing_required = _validate_required_columns(columns)
     required_columns_present = 100.0 if not missing_required else 0.0
     if missing_required:
-        issues.append({"row_index": -1, "message": f"Missing required columns: {', '.join(missing_required)}"})
+        issues.append({"row_index": -1, "message": f"Missing required columns: {', '.join(missing_required)}", "fields": missing_required})
 
     # Row-wise checks
     valid_date_count = 0
@@ -402,6 +438,7 @@ def _analyze_rows(rows: List[Dict[str, Any]], columns: List[str]) -> Tuple[Dict[
     # Optional column mapping for HS rules
     colmap = _map_optional_columns(columns)
 
+    rows_with_violation: Set[int] = set()
     for idx, r in enumerate(rows):
         row_valid = True
 
@@ -410,8 +447,9 @@ def _analyze_rows(rows: List[Dict[str, Any]], columns: List[str]) -> Tuple[Dict[
         if date_str and _parse_date_safe(date_str):
             valid_date_count += 1
         else:
-            issues.append({"row_index": idx, "message": "Invalid or missing date; expected format YYYY-MM-DD"})
+            issues.append({"row_index": idx, "message": "Invalid or missing date; expected format YYYY-MM-DD", "fields": ["date"]})
             row_valid = False
+            rows_with_violation.add(idx)
 
         # complaint_id uniqueness
         cid = (r.get("complaint_id") or "").strip()
@@ -419,12 +457,14 @@ def _analyze_rows(rows: List[Dict[str, Any]], columns: List[str]) -> Tuple[Dict[
             unique_ok_count += 1
         else:
             if not cid:
-                issues.append({"row_index": idx, "message": "Missing complaint_id"})
+                issues.append({"row_index": idx, "message": "Missing complaint_id", "fields": ["complaint_id"]})
                 row_valid = False
+                rows_with_violation.add(idx)
             elif id_counts.get(cid, 0) > 1:
                 if cid not in seen_ids:
-                    issues.append({"row_index": idx, "message": f"Duplicate complaint_id '{cid}'"})
+                    issues.append({"row_index": idx, "message": f"Duplicate complaint_id '{cid}'", "fields": ["complaint_id"]})
                 row_valid = False
+                rows_with_violation.add(idx)
         seen_ids.add(cid)
 
         # non-empty description (prefer specific column if present)
@@ -433,17 +473,24 @@ def _analyze_rows(rows: List[Dict[str, Any]], columns: List[str]) -> Tuple[Dict[
         if desc:
             non_empty_desc_count += 1
         else:
-            issues.append({"row_index": idx, "message": "Empty description"})
+            issues.append({"row_index": idx, "message": "Empty description", "fields": [desc_col]})
             row_valid = False
+            rows_with_violation.add(idx)
 
         # Hazardous situation / device use validations
         hs_issues = _row_hs_checks(r, colmap)
         for iss in hs_issues:
             iss["row_index"] = idx
             issues.append(iss)
+            rows_with_violation.add(idx)
             code = iss.get("code")
             if code:
                 hs_summary[code] = hs_summary.get(code, 0) + 1
+        # Aggregate derived hazards from this row's narrative to dataset-level set
+        # Re-derive using same logic to avoid leaking internals out of helper
+        from_text = _derive_hazards_from_text((r.get(colmap.get("problem_definition_description") or "description") or ""),
+                                              (r.get(colmap.get("investigation_summary") or "") or ""))
+        dataset_derived_hazards.update(from_text)
 
         if row_valid:
             valid_rows_count += 1
@@ -549,7 +596,7 @@ class ComplaintsAnalyze(MethodView):
             rows = stored["rows"]
             columns = stored["columns"]
 
-        completeness, issues, hs_summary = _analyze_rows(rows, columns)
+        completeness, issues, hs_summary, derived_hazards, summary = _analyze_rows(rows, columns)
         analysis_id = str(uuid.uuid4())
         result = {
             "analysis_id": analysis_id,
@@ -557,7 +604,9 @@ class ComplaintsAnalyze(MethodView):
             "issues": issues,
             "row_count": len(rows),
             "columns": columns,
-            "hs_summary": hs_summary
+            "hs_summary": hs_summary,
+            "derived_hazards": derived_hazards,
+            "summary": summary
         }
         ANALYSIS_STORE[analysis_id] = result
         return result
