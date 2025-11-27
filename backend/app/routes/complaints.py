@@ -392,6 +392,8 @@ def _analyze_rows(rows: List[Dict[str, Any]], columns: List[str]) -> Tuple[Dict[
       - completeness metrics
       - issues list (with per-row codes/details)
       - hs_summary: counts of hazardous situation rule violations by code
+      - derived_hazards: unique set of hazards derived from narratives across all rows
+      - summary: high-level counters for quick UI display
     """
     issues: List[Dict[str, Any]] = []
     hs_summary: Dict[str, int] = {code: 0 for code in RULE_CODES.values()}
@@ -413,7 +415,8 @@ def _analyze_rows(rows: List[Dict[str, Any]], columns: List[str]) -> Tuple[Dict[
             "rows_with_violations": 0,
             "rows_without_violations": 0
         }
-        return completeness, issues, hs_summary, sorted(list(dataset_derived_hazards)), summary, [], summary
+        # Return with enriched fields even for empty dataset
+        return completeness, issues, hs_summary, sorted(list(dataset_derived_hazards)), summary
 
     missing_required = _validate_required_columns(columns)
     required_columns_present = 100.0 if not missing_required else 0.0
@@ -502,7 +505,18 @@ def _analyze_rows(rows: List[Dict[str, Any]], columns: List[str]) -> Tuple[Dict[
         "description_non_empty": round((non_empty_desc_count / total) * 100.0, 2),
         "overall_valid_rows": round((valid_rows_count / total) * 100.0, 2),
     }
-    return completeness, issues, hs_summary
+
+    # Build high-level summary counters
+    total_violations = len([i for i in issues if i.get("row_index", -1) >= 0])
+    rows_with_violations = len({i["row_index"] for i in issues if i.get("row_index", -1) >= 0})
+    rows_without_violations = max(total - rows_with_violations, 0)
+    summary = {
+        "total_violations": total_violations,
+        "rows_with_violations": rows_with_violations,
+        "rows_without_violations": rows_without_violations
+    }
+
+    return completeness, issues, hs_summary, sorted(list(dataset_derived_hazards)), summary
 
 
 # Routes
